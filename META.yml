@@ -13,6 +13,7 @@ meta-spec:
 name: Perl-Portable
 no_index:
   directory:
+    - share
     - inc
     - t
 requires:
@@ -22,4 +23,4 @@ requires:
   Params::Util: 0.31
   YAML::Tiny: 1.29
   perl: 5.8.0
-version: 0.01
+version: 0.02

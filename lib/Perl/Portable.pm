@@ -38,6 +38,7 @@ For now, see the code for more...
 
 use 5.008;
 use strict;
+use Config ();
 use Carp             'croak';
 use File::Spec       ();
 use List::Util       ();
@@ -46,7 +47,7 @@ use YAML::Tiny       ();
 
 use vars qw{$VERSION $FAKE_PERL};
 BEGIN {
-	$VERSION   = '0.01';
+	$VERSION   = '0.02';
 
 	# This variable is provided exclusively for the
 	# use of test scripts.
@@ -57,25 +58,8 @@ use Object::Tiny qw{
 	dist_volume
 	dist_dirs
 	dist_root
-	abs_conf
-	abs_perl
-	abs_perl_bin
-	abs_perl_lib
-	abs_perl_sitelib
-	abs_cpan
-	abs_c_bin
-	abs_c_lib
-	abs_c_include
-};
-
-use constant RESOURCES => qw{
-	perl_bin
-	perl_lib
-	perl_sitelib
-	cpan
-	c_bin
-	c_lib
-	c_include
+	conf
+	perlpath
 };
 
 
@@ -114,37 +98,58 @@ sub new {
 	unless ( _ARRAY($self->{portable}->{ENV}->{INCLUDE}) ) {
 		croak('Missing or invalid ENV.INCLUDE key in portable.perl');
 	}
+	unless ( _HASH($self->{portable}->{config}) ) {
+		croak('Missing or invalid config key in portable.perl');
+	}
 
-	# Check the portable path are defined
-	foreach ( RESOURCES ) {
-		my $portable = "portable_$_";
-		my $absolute = "abs_$_";
-		unless ( $self->$portable() ) {
-			croak("Missing $_ key in portable.perl");
+	# Ignore errors
+	eval { require 'Config_heavy.pl'; };
+
+	# Localize up the config entries
+	my $config  = $self->{config} = {};
+	my $pconfig = $self->{portable}->{config};
+	my %file    = map { $_ => 1 } qw{ perlpath          };
+	my %post    = map { $_ => 1 } qw{ ldflags lddlflags };
+	foreach my $key ( sort keys %$pconfig ) {
+		unless ( defined $pconfig->{$key} and length $pconfig->{$key} and ! $post{$key} ) {
+			$config->{$key} = $pconfig->{$key};
+			next;
 		}
-		$self->{$absolute} = File::Spec->catdir(
-			$self->dist_root, $self->$portable(),
-		);
-		next if -d $self->$absolute();
-		croak("Invalid $_ key in portable.perl");
+		my @parts = split /\//, $pconfig->{$key};
+		if ( $file{$key} ) {
+			$config->{$key} = File::Spec->catfile(
+				$self->dist_root, @parts,
+			);
+		} else {
+			$config->{$key} = File::Spec->catdir(
+				$self->dist_root, @parts,
+			);
+		}
+	}
+	foreach my $key ( sort keys %post ) {
+		$config->{$key} =~ s/\$(\w+)/$config->{$1}/g;
 	}
 
 	return $self;
 }
 
-sub find {
-	my $class    = shift;
-	my $abs_perl = ($ENV{HARNESS_ACTIVE} and $FAKE_PERL) ? $FAKE_PERL : $^X;
+my $DEFAULT = undef;
+
+sub default {
+	return $DEFAULT if $DEFAULT;
+
+	# Get the perl executable location
+	my $perlpath = ($ENV{HARNESS_ACTIVE} and $FAKE_PERL) ? $FAKE_PERL : $^X;
 
 	# The path to Perl has a localized path.
 	# G:\\strawberry\\perl\\bin\\perl.exe
 	# Split it up, and search upwards to try and locate the
 	# portable.perl file in the distribution root.
-	my ($dist_volume, $d, $f) = File::Spec->splitpath($abs_perl);
+	my ($dist_volume, $d, $f) = File::Spec->splitpath($perlpath);
 	my @d = File::Spec->splitdir($d);
 	pop @d if $d[-1] eq '';
 	my $dist_dirs = List::Util::first {
-			-f File::Spec->catpath( $dist_volume, $_, $class->portable_conf )
+			-f File::Spec->catpath( $dist_volume, $_, portable_conf() )
 		}
 		map {
 			File::Spec->catdir(@d[0 .. $_])
@@ -155,23 +160,25 @@ sub find {
 
 	# Derive the main paths from the plain dirs
 	my $dist_root = File::Spec->catpath($dist_volume, $dist_dirs, '');
-	my $abs_conf  = File::Spec->catpath($dist_volume, $dist_dirs, $class->portable_conf);
+	my $conf      = File::Spec->catpath($dist_volume, $dist_dirs, portable_conf());
 
 	# Load the YAML file
-	my $portable = YAML::Tiny::LoadFile( $abs_conf );
+	my $portable = YAML::Tiny::LoadFile( $conf );
 	unless ( _HASH($portable) ) {
 		croak("Missing or invalid portable.perl file");
 	}
 
 	# Hand off to the main constructor
-	$class->new(
+	$DEFAULT = __PACKAGE__->new(
 		dist_volume => $dist_volume,
 		dist_dirs   => $dist_dirs,
 		dist_root   => $dist_root,
-		abs_conf    => $abs_conf,
-		abs_perl    => $abs_perl,
+		conf        => $conf,
+		perlpath    => $perlpath,
 		portable    => $portable,
 	);
+
+	return $DEFAULT;
 }
 
 
@@ -183,18 +190,6 @@ sub find {
 
 sub portable_conf {
 	'portable.perl';
-}
-
-sub portable_perl_bin {
-	$_[0]->{portable}->{perl_bin};
-}
-
-sub portable_perl_lib {
-	$_[0]->{portable}->{perl_lib};
-}
-
-sub portable_perl_sitelib {
-	$_[0]->{portable}->{perl_sitelib};
 }
 
 sub portable_cpan {
@@ -211,6 +206,14 @@ sub portable_c_lib {
 
 sub portable_c_include {
 	$_[0]->{portable}->{c_include};
+}
+
+sub portable_config {
+	$_[0]->{portable}->{config};
+}
+
+sub portable_env {
+	$_[0]->{portable}->{ENV};
 }
 
 sub portable_env_path {
@@ -230,28 +233,19 @@ sub portable_env_include {
 
 
 #####################################################################
-# Support Methods
+# Main Interface
 
-# Convert a portable path into a relative path
-sub _dir {
-	my $self = shift;
-	my $unix = shift;
-	my @dir  = File::Spec::Unix->splitdir($unix);
-	File::Spec->catdir( $self->dist_root, @dir );
+sub config {
+	my $config = default()->{config};
+	exists $config->{$_[0]} ? $config->{$_[0]} : $_[1];
 }
 
-sub _file {
-	my $self = shift;
-	my $unix = shift;
-	my ($v,$d,$f) = File::Spec::Unix->splitpath($unix);
-	$d = File::Spec->catdir( $self->dist_root, $d );
-	File::Spec->catfile(
-		File::Spec->catdir(
-			$self->dist_root,
-			$d,
-		),
-		$f,
-	);
+sub apply {
+	my $config = default()->{config};
+	foreach my $k ( %$config ) {
+		$Config::Config{$k} = $config->{$k};
+	}
+	return 1;
 }
 
 1;
